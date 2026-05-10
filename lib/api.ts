@@ -1,6 +1,6 @@
 const BASE_URL = process.env.NEXT_PUBLIC_API_URL ?? "https://text-extractor-engine.fly.dev";
 
-export type OcrEngine = "tesseract" | "easyocr";
+export type OcrEngine = "tesseract" | "paddleocr" | "doctr";
 
 export type PageResult = {
   page: number;

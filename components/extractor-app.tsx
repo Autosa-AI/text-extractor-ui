@@ -20,9 +20,10 @@ const EXT_LABEL: Record<string, string> = {
   docx: "Word Document", xlsx: "Excel Spreadsheet", pptx: "PowerPoint Presentation",
 };
 
-const ENGINE_OPTIONS: { value: OcrEngine; label: string; desc: string }[] = [
-  { value: "tesseract", label: "Tesseract", desc: "Fast · Low memory" },
-  { value: "easyocr",  label: "EasyOCR",   desc: "Accurate · Deep learning" },
+const ENGINE_OPTIONS: { value: OcrEngine; label: string; desc: string; badge: string }[] = [
+  { value: "tesseract", label: "Tesseract", desc: "Clean printed docs · Fast · Low memory",            badge: "Default" },
+  { value: "paddleocr", label: "PaddleOCR", desc: "Complex layouts · Rotated text · High accuracy",    badge: "Recommended" },
+  { value: "doctr",     label: "Doctr",     desc: "Invoices · Forms · Structured reports",             badge: "Document AI" },
 ];
 
 function fileExt(name: string) { return name.split(".").pop()?.toLowerCase() ?? ""; }
@@ -193,7 +194,7 @@ export default function ExtractorApp() {
                   border: "1px solid #222",
                   borderRadius: 10,
                   overflow: "hidden",
-                  minWidth: 180,
+                  minWidth: 230,
                   boxShadow: "0 8px 32px rgba(0,0,0,0.6)",
                 }}>
                   <div style={{ padding: "6px 10px 4px", borderBottom: "1px solid #1a1a1a" }}>
@@ -207,7 +208,7 @@ export default function ExtractorApp() {
                       onClick={() => { setEngine(opt.value); setEngineOpen(false); }}
                       style={{
                         display: "flex",
-                        alignItems: "center",
+                        alignItems: "flex-start",
                         justifyContent: "space-between",
                         width: "100%",
                         padding: "9px 12px",
@@ -219,33 +220,29 @@ export default function ExtractorApp() {
                         transition: "background 0.1s",
                       }}
                     >
-                      <div>
-                        <div style={{ color: engine === opt.value ? "#fff" : "#aaa", fontSize: 12, fontWeight: 500 }}>
-                          {opt.label}
+                      <div style={{ flex: 1 }}>
+                        <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 2 }}>
+                          <span style={{ color: engine === opt.value ? "#fff" : "#aaa", fontSize: 12, fontWeight: 500 }}>
+                            {opt.label}
+                          </span>
+                          <span style={{
+                            fontSize: 9, fontWeight: 600, letterSpacing: "0.04em",
+                            color: "#555", background: "#1a1a1a",
+                            border: "1px solid #252525", borderRadius: 3,
+                            padding: "1px 5px",
+                          }}>
+                            {opt.badge}
+                          </span>
                         </div>
-                        <div style={{ color: "#444", fontSize: 10, marginTop: 1 }}>{opt.desc}</div>
+                        <div style={{ color: "#3a3a3a", fontSize: 10 }}>{opt.desc}</div>
                       </div>
                       {engine === opt.value && (
-                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#f97316" strokeWidth="2.5">
+                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#f97316" strokeWidth="2.5" style={{ marginTop: 2, flexShrink: 0 }}>
                           <polyline points="20 6 9 17 4 12"/>
                         </svg>
                       )}
                     </button>
                   ))}
-                  {engine === "easyocr" && (
-                    <div style={{
-                      margin: "4px 8px 8px",
-                      padding: "6px 8px",
-                      background: "rgba(249,115,22,0.06)",
-                      border: "1px solid rgba(249,115,22,0.15)",
-                      borderRadius: 6,
-                      fontSize: 10,
-                      color: "#f97316aa",
-                      lineHeight: 1.5,
-                    }}>
-                      ⚠ Requires full deployment with PyTorch
-                    </div>
-                  )}
                 </div>
               </>
             )}
