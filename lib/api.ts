@@ -1,5 +1,7 @@
 const BASE_URL = process.env.NEXT_PUBLIC_API_URL ?? "https://text-extractor-engine.fly.dev";
 
+export type OcrEngine = "tesseract" | "easyocr";
+
 export type PageResult = {
   page: number;
   text: string;
@@ -18,9 +20,10 @@ export type ExtractionResult = {
   method: "native" | "ocr" | "hybrid";
 };
 
-export async function extractText(file: File): Promise<ExtractionResult> {
+export async function extractText(file: File, engine: OcrEngine): Promise<ExtractionResult> {
   const form = new FormData();
   form.append("file", file);
+  form.append("engine", engine);
 
   const res = await fetch(`${BASE_URL}/api/v1/extract/`, {
     method: "POST",
