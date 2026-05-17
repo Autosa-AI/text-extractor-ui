@@ -1,7 +1,7 @@
 "use client";
 
 import Image from "next/image";
-import { useState, useRef, useCallback, DragEvent, ChangeEvent } from "react";
+import { useState, useRef, useCallback, useEffect, DragEvent, ChangeEvent } from "react";
 import {
   extractText,
   extractInvoice,
@@ -13,8 +13,26 @@ import {
 } from "@/lib/api";
 
 type Status     = "idle" | "loading" | "done" | "error";
-type Mode       = "invoice" | "text";
+type Mode       = "invoice" | "text" | "batch";
 type InvoiceView = "fields" | "json";
+type BatchFile  = {
+  id: string;
+  file: File;
+  status: "pending" | "processing" | "done" | "error";
+  result?: InvoiceExtractionResult;
+  error?: string;
+  duplicate?: HistoryRecord | null;
+};
+type VendorRecord = { CardCode: string; CardName: string };
+type HistoryRecord = {
+  key: string;
+  filename: string;
+  processedAt: string;
+  vendor: string;
+  invoiceNo: string;
+  total: number | null;
+  currency: string;
+};
 
 const ACCEPTED = [
   "application/pdf",
@@ -152,6 +170,54 @@ function displayValue(key: string, val: unknown): string {
   return String(val);
 }
 
+function makeInvoiceKey(h: InvoiceExtractionResult["header"]): string {
+  const vendor  = (h.CardName ?? "").toLowerCase().trim();
+  const invNo   = (h.NumAtCard ?? h.TaxInvoiceNo ?? "").toLowerCase().trim();
+  const date    = h.DocDate ?? "";
+  const total   = String(h.DocTotal ?? "");
+  return `${vendor}|${invNo}|${date}|${total}`;
+}
+
+function matchVendor(
+  cardName: string | null | undefined,
+  vendors: VendorRecord[],
+): { vendor: VendorRecord; score: number } | null {
+  if (!cardName || !vendors.length) return null;
+  const name = cardName.toLowerCase().trim();
+  let best: { vendor: VendorRecord; score: number } | null = null;
+  for (const v of vendors) {
+    const vn = v.CardName.toLowerCase().trim();
+    let score = 0;
+    if (vn === name) {
+      score = 1;
+    } else if (vn.includes(name) || name.includes(vn)) {
+      score = 0.85;
+    } else {
+      const nw = name.split(/\s+/).filter(w => w.length > 2);
+      const vw = vn.split(/\s+/).filter(w => w.length > 2);
+      const hits = nw.filter(w => vw.some(vv => vv.includes(w) || w.includes(vv)));
+      if (nw.length && hits.length) score = hits.length / Math.max(nw.length, vw.length);
+    }
+    if (score > 0.5 && (!best || score > best.score)) best = { vendor: v, score };
+  }
+  return best;
+}
+
+function parseVendorCsv(text: string): VendorRecord[] {
+  const lines = text.trim().split(/\r?\n/);
+  if (lines.length < 2) return [];
+  const headers = lines[0].split(",").map(h => h.trim().replace(/^"|"$/g, "").toLowerCase());
+  const ci = headers.findIndex(h => h.includes("cardcode") || h === "code" || h === "vendor code");
+  const ni = headers.findIndex(h => h.includes("cardname") || h === "name" || h === "vendor name");
+  if (ci === -1 || ni === -1) return [];
+  return lines.slice(1)
+    .map(line => {
+      const cols = line.split(",").map(c => c.trim().replace(/^"|"$/g, ""));
+      return { CardCode: cols[ci] ?? "", CardName: cols[ni] ?? "" };
+    })
+    .filter(v => v.CardCode && v.CardName);
+}
+
 export default function ExtractorApp() {
   // ── File state ──
   const [file, setFile]             = useState<File | null>(null);
@@ -182,6 +248,29 @@ export default function ExtractorApp() {
   const [invoiceMethod, setInvoiceMethod]         = useState<InvoiceMethod>("vlm");
   const [invoiceMethodOpen, setInvoiceMethodOpen] = useState(false);
 
+  // ── Batch state ──
+  const [batchFiles, setBatchFiles] = useState<BatchFile[]>([]);
+  const [batchRunning, setBatchRunning] = useState(false);
+  const batchInputRef = useRef<HTMLInputElement>(null);
+
+  // ── Vendor matching ──
+  const [vendors, setVendors]       = useState<VendorRecord[]>([]);
+  const [vendorOpen, setVendorOpen] = useState(false);
+  const vendorCsvRef = useRef<HTMLInputElement>(null);
+
+  // ── Invoice history (duplicate detection) ──
+  const [invoiceHistory, setInvoiceHistory] = useState<HistoryRecord[]>([]);
+  const [invoiceDuplicate, setInvoiceDuplicate] = useState<HistoryRecord | null>(null);
+
+  // useEffect(() => {
+  //   try {
+  //     const v = localStorage.getItem("invoice_vendors");
+  //     if (v) setVendors(JSON.parse(v));
+  //     const h = localStorage.getItem("invoice_history");
+  //     if (h) setInvoiceHistory(JSON.parse(h));
+  //   } catch {}
+  // }, []);
+
   // ── File handlers ──
   const handleFile = useCallback((f: File) => {
     if (previewUrl) URL.revokeObjectURL(previewUrl);
@@ -211,9 +300,11 @@ export default function ExtractorApp() {
   const onExtract = async () => {
     if (!file) return;
     if (mode === "invoice") {
-      setInvoiceStatus("loading"); setInvoiceError(""); setInvoiceResult(null);
+      setInvoiceStatus("loading"); setInvoiceError(""); setInvoiceResult(null); setInvoiceDuplicate(null);
       try {
         const res = await extractInvoice(file, invoiceMethod);
+        setInvoiceDuplicate(findDuplicate(res));
+        addToHistory(res);
         setInvoiceResult(res);
         setInvoiceView("fields");
         setInvoiceStatus("done");
@@ -244,6 +335,148 @@ export default function ExtractorApp() {
   const onCopyText = async () => {
     await navigator.clipboard.writeText(text);
     setCopiedText(true); setTimeout(() => setCopiedText(false), 2000);
+  };
+
+  // ── Vendor handlers ──
+  const onLoadVendorCsv = (e: ChangeEvent<HTMLInputElement>) => {
+    const f = e.target.files?.[0];
+    if (!f) return;
+    const reader = new FileReader();
+    reader.onload = ev => {
+      const records = parseVendorCsv(ev.target?.result as string);
+      setVendors(records);
+      // localStorage.setItem("invoice_vendors", JSON.stringify(records));
+    };
+    reader.readAsText(f);
+    e.target.value = "";
+  };
+  const onClearVendors = () => {
+    setVendors([]);
+    // localStorage.removeItem("invoice_vendors");
+  };
+
+  // ── History helpers ──
+  const addToHistory = (result: InvoiceExtractionResult) => {
+    const key = makeInvoiceKey(result.header);
+    if (!key.replace(/\|/g, "").trim()) return;
+    const record: HistoryRecord = {
+      key,
+      filename: result.filename,
+      processedAt: new Date().toISOString(),
+      vendor: result.header.CardName ?? "",
+      invoiceNo: result.header.NumAtCard ?? result.header.TaxInvoiceNo ?? "",
+      total: result.header.DocTotal ?? null,
+      currency: result.header.DocCurrency ?? "",
+    };
+    setInvoiceHistory(prev => {
+      const next = [record, ...prev.filter(h => h.key !== key)].slice(0, 1000);
+      // localStorage.setItem("invoice_history", JSON.stringify(next));
+      return next;
+    });
+  };
+  const findDuplicate = (result: InvoiceExtractionResult): HistoryRecord | null => {
+    const key = makeInvoiceKey(result.header);
+    if (!key.replace(/\|/g, "").trim()) return null;
+    return invoiceHistory.find(h => h.key === key) ?? null;
+  };
+
+  // ── Batch handlers ──
+  const onAddBatchFiles = useCallback((files: FileList | null) => {
+    if (!files) return;
+    const next: BatchFile[] = Array.from(files).map(f => ({
+      id: `${f.name}-${f.size}-${Math.random()}`,
+      file: f,
+      status: "pending",
+    }));
+    setBatchFiles(prev => [...prev, ...next]);
+  }, []);
+
+  const onRemoveBatchFile = (id: string) =>
+    setBatchFiles(prev => prev.filter(bf => bf.id !== id));
+
+  const onClearBatch = () => { setBatchFiles([]); };
+
+  const onProcessBatch = async () => {
+    if (batchRunning) return;
+    const pending = batchFiles.filter(bf => bf.status === "pending");
+    if (pending.length === 0) return;
+    setBatchRunning(true);
+    for (const bf of pending) {
+      setBatchFiles(prev => prev.map(f => f.id === bf.id ? { ...f, status: "processing" } : f));
+      try {
+        const result = await extractInvoice(bf.file, invoiceMethod);
+        const duplicate = findDuplicate(result);
+        addToHistory(result);
+        setBatchFiles(prev => prev.map(f => f.id === bf.id ? { ...f, status: "done", result, duplicate } : f));
+      } catch (e: unknown) {
+        const error = e instanceof Error ? e.message : "Unknown error";
+        setBatchFiles(prev => prev.map(f => f.id === bf.id ? { ...f, status: "error", error } : f));
+      }
+    }
+    setBatchRunning(false);
+  };
+
+  const onExportExcel = async () => {
+    const done = batchFiles.filter(bf => bf.status === "done" && bf.result);
+    if (done.length === 0) return;
+    const XLSX = await import("xlsx");
+    const wb = XLSX.utils.book_new();
+
+    const headerRows = done.map(({ result: r }) => ({
+      "Filename": r!.filename,
+      "Invoice No.": r!.header.NumAtCard ?? "",
+      "Tax Invoice No.": r!.header.TaxInvoiceNo ?? "",
+      "PO Number": r!.header.PurchaseOrderNo ?? "",
+      "Vendor": r!.header.CardName ?? "",
+      "Vendor Tax ID": r!.header.VendorTaxId ?? "",
+      "Vendor Address": r!.header.VendorAddress ?? "",
+      "Bill To": r!.header.BillToName ?? "",
+      "Bill To Address": r!.header.BillToAddress ?? "",
+      "Invoice Date": r!.header.DocDate ?? "",
+      "Due Date": r!.header.DocDueDate ?? "",
+      "Currency": r!.header.DocCurrency ?? "",
+      "Subtotal": r!.header.DocSubTotal ?? "",
+      "Discount Amt": r!.header.DiscountSum ?? "",
+      "Freight": r!.header.FreightSum ?? "",
+      "VAT %": r!.header.VatPercent ?? "",
+      "VAT Amount": r!.header.VatSum ?? "",
+      "Total": r!.header.DocTotal ?? "",
+      "Payment Method": r!.header.PaymentMethod ?? "",
+      "Bank": r!.header.BankName ?? "",
+      "Account No.": r!.header.BankAccountNo ?? "",
+      "IBAN": r!.header.IBAN ?? "",
+      "SWIFT": r!.header.SwiftCode ?? "",
+      "Comments": r!.header.Comments ?? "",
+      "Vendor Code (Matched)": matchVendor(r!.header.CardName, vendors)?.vendor.CardCode ?? "",
+      "Duplicate Warning": batchFiles.find(bf => bf.result === r)?.duplicate ? "DUPLICATE" : "",
+      "Model Used": r!.model_used,
+    }));
+    const ws1 = XLSX.utils.json_to_sheet(headerRows);
+    XLSX.utils.book_append_sheet(wb, ws1, "Invoice Headers");
+
+    const lineRows = done.flatMap(({ result: r }) =>
+      (r!.lines ?? []).map((line, i) => ({
+        "Filename": r!.filename,
+        "Invoice No.": r!.header.NumAtCard ?? "",
+        "Line #": i + 1,
+        "Item Code": line.ItemCode ?? "",
+        "Description": line.ItemDescription ?? line.FreeText ?? "",
+        "Supplier Cat No.": line.SupplierCatNo ?? "",
+        "UoM": line.UoMCode ?? "",
+        "Quantity": line.Quantity ?? "",
+        "Unit Price": line.Price ?? "",
+        "Discount %": line.DiscountPercent ?? "",
+        "Line Total": line.LineTotal ?? "",
+        "VAT %": line.VatPercent ?? "",
+        "Account Code": line.AccountCode ?? "",
+      }))
+    );
+    if (lineRows.length > 0) {
+      const ws2 = XLSX.utils.json_to_sheet(lineRows);
+      XLSX.utils.book_append_sheet(wb, ws2, "Line Items");
+    }
+
+    XLSX.writeFile(wb, `invoices_${new Date().toISOString().slice(0, 10)}.xlsx`);
   };
 
   // ── Derived ──
@@ -355,9 +588,9 @@ export default function ExtractorApp() {
 
           <div style={{ width: 1, height: 16, background: "#1e1e1e" }} />
 
-          {/* Invoice Method — dimmed when text tab active */}
-          <div style={{ position: "relative", opacity: mode === "invoice" ? 1 : 0.35, transition: "opacity 0.2s" }}>
-            <button onClick={() => mode === "invoice" && setInvoiceMethodOpen(o => !o)} style={{
+          {/* Invoice Method — dimmed when raw text tab active */}
+          <div style={{ position: "relative", opacity: mode !== "text" ? 1 : 0.35, transition: "opacity 0.2s" }}>
+            <button onClick={() => mode !== "text" && setInvoiceMethodOpen(o => !o)} style={{
               display: "flex", alignItems: "center", gap: 8, background: "#141414",
               border: "1px solid #222", borderRadius: 8, padding: "6px 12px",
               cursor: mode === "invoice" ? "pointer" : "default",
@@ -375,7 +608,7 @@ export default function ExtractorApp() {
                 <polyline points="6 9 12 15 18 9"/>
               </svg>
             </button>
-            {invoiceMethodOpen && mode === "invoice" && (
+            {invoiceMethodOpen && mode !== "text" && (
               <>
                 <div style={{ position: "fixed", inset: 0, zIndex: 30 }} onClick={() => setInvoiceMethodOpen(false)} />
                 <div style={{
@@ -411,6 +644,74 @@ export default function ExtractorApp() {
                       )}
                     </button>
                   ))}
+                </div>
+              </>
+            )}
+          </div>
+
+          <div style={{ width: 1, height: 16, background: "#1e1e1e" }} />
+
+          {/* Vendors */}
+          <div style={{ position: "relative" }}>
+            <button onClick={() => setVendorOpen(o => !o)} style={{
+              display: "flex", alignItems: "center", gap: 7, background: "#141414",
+              border: "1px solid #222", borderRadius: 8, padding: "6px 12px",
+              cursor: "pointer", color: "#ccc", fontSize: 12, fontWeight: 500,
+            }}>
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke={vendors.length ? "#22c55e" : "#888"} strokeWidth="2">
+                <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/>
+                <circle cx="9" cy="7" r="4"/>
+                <path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/>
+              </svg>
+              <span style={{ color: vendors.length ? "#22c55e" : "#999", fontSize: 11 }}>
+                Vendors{vendors.length > 0 ? ` (${vendors.length})` : ""}
+              </span>
+            </button>
+            {vendorOpen && (
+              <>
+                <div style={{ position: "fixed", inset: 0, zIndex: 30 }} onClick={() => setVendorOpen(false)} />
+                <div style={{
+                  position: "absolute", top: "calc(100% + 6px)", right: 0, zIndex: 40,
+                  background: "#111", border: "1px solid #222", borderRadius: 10,
+                  overflow: "hidden", minWidth: 260, boxShadow: "0 8px 32px rgba(0,0,0,0.6)",
+                }}>
+                  <div style={{ padding: "10px 14px 8px", borderBottom: "1px solid #1a1a1a" }}>
+                    <span style={{ fontSize: 10, color: "#444", letterSpacing: "0.06em", fontWeight: 600 }}>VENDOR MASTER LIST</span>
+                    {vendors.length > 0 && (
+                      <span style={{ float: "right", fontSize: 10, color: "#22c55e" }}>{vendors.length} vendors loaded</span>
+                    )}
+                  </div>
+                  <div style={{ padding: "10px 14px", display: "flex", flexDirection: "column", gap: 8 }}>
+                    <p style={{ fontSize: 11, color: "#444", lineHeight: 1.5 }}>
+                      Upload a CSV with <span style={{ color: "#666", fontFamily: "monospace" }}>CardCode</span> and <span style={{ color: "#666", fontFamily: "monospace" }}>CardName</span> columns. Extracted vendor names will be auto-matched.
+                    </p>
+                    <button
+                      onClick={() => vendorCsvRef.current?.click()}
+                      style={{ background: "#1a1a1a", border: "1px solid #2a2a2a", borderRadius: 6, color: "#aaa", cursor: "pointer", fontSize: 11, padding: "7px 12px", textAlign: "left" }}
+                    >
+                      {vendors.length > 0 ? "↑ Replace CSV" : "↑ Upload Vendor CSV"}
+                    </button>
+                    <input ref={vendorCsvRef} type="file" accept=".csv,.txt" onChange={onLoadVendorCsv} style={{ display: "none" }} />
+                    {vendors.length > 0 && (
+                      <>
+                        <div style={{ maxHeight: 120, overflowY: "auto", display: "flex", flexDirection: "column", gap: 2 }}>
+                          {vendors.slice(0, 50).map(v => (
+                            <div key={v.CardCode} style={{ display: "flex", gap: 8, fontSize: 10 }}>
+                              <span style={{ color: "#f97316", fontFamily: "monospace", minWidth: 70 }}>{v.CardCode}</span>
+                              <span style={{ color: "#555" }}>{v.CardName}</span>
+                            </div>
+                          ))}
+                          {vendors.length > 50 && <span style={{ fontSize: 10, color: "#333" }}>…and {vendors.length - 50} more</span>}
+                        </div>
+                        <button
+                          onClick={() => { onClearVendors(); setVendorOpen(false); }}
+                          style={{ background: "transparent", border: "1px solid #2a1515", borderRadius: 6, color: "#7f1d1d", cursor: "pointer", fontSize: 11, padding: "5px 12px" }}
+                        >
+                          Clear vendor list
+                        </button>
+                      </>
+                    )}
+                  </div>
                 </div>
               </>
             )}
@@ -467,6 +768,21 @@ export default function ExtractorApp() {
                   Raw Text
                 </span>
               </button>
+              <button onClick={() => setMode("batch")} style={tabBtn(mode === "batch")}>
+                <span style={{ display: "flex", alignItems: "center", gap: 5 }}>
+                  <svg width="11" height="11" viewBox="0 0 24 24" fill="none"
+                    stroke={mode === "batch" ? "#888" : "#2a2a2a"} strokeWidth="2">
+                    <rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/>
+                    <rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/>
+                  </svg>
+                  Batch
+                  {batchFiles.length > 0 && (
+                    <span style={{ fontSize: 9, background: "#f97316", color: "#000", borderRadius: 3, padding: "0 4px", fontWeight: 700, lineHeight: "14px" }}>
+                      {batchFiles.length}
+                    </span>
+                  )}
+                </span>
+              </button>
             </div>
 
             {/* Right-side controls — change per tab */}
@@ -493,6 +809,26 @@ export default function ExtractorApp() {
                       : <><svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>Copy JSON</>
                     }
                   </button>
+                </>
+              ) : mode === "batch" ? (
+                <>
+                  {batchFiles.length > 0 && (
+                    <span style={{ fontSize: 11, color: "#333", marginRight: 2 }}>
+                      {batchFiles.filter(f => f.status === "done").length}/{batchFiles.length} done
+                    </span>
+                  )}
+                  <button
+                    onClick={onExportExcel}
+                    disabled={!batchFiles.some(f => f.status === "done")}
+                    style={iconBtn(batchFiles.some(f => f.status === "done"), batchFiles.some(f => f.status === "done"))}
+                  >
+                    <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                      <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                      <polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>
+                    </svg>
+                    Export Excel
+                  </button>
+                  <button onClick={onClearBatch} disabled={batchFiles.length === 0} style={iconBtn(batchFiles.length > 0)}>Clear</button>
                 </>
               ) : (
                 <>
@@ -553,12 +889,34 @@ export default function ExtractorApp() {
                 {/* Fields view */}
                 {invoiceResult && invoiceView === "fields" && (
                   <div style={{ padding: "14px 16px", display: "flex", flexDirection: "column", gap: 20 }}>
-                    {/* model badge */}
-                    <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                    {/* model badge + duplicate warning */}
+                    <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
                       <span style={{ fontSize: 9, color: "#3a3a3a", background: "#141414", border: "1px solid #1e1e1e", borderRadius: 3, padding: "2px 7px", fontFamily: "monospace" }}>
                         {invoiceResult.model_used}
                       </span>
+                      {(() => {
+                        const match = matchVendor(invoiceResult.header.CardName, vendors);
+                        return match ? (
+                          <span style={{ fontSize: 9, color: "#f97316", background: "rgba(249,115,22,0.08)", border: "1px solid rgba(249,115,22,0.2)", borderRadius: 3, padding: "2px 7px", fontFamily: "monospace" }}>
+                            Vendor: {match.vendor.CardCode} ({Math.round(match.score * 100)}% match)
+                          </span>
+                        ) : null;
+                      })()}
                     </div>
+
+                    {/* Duplicate warning */}
+                    {invoiceDuplicate && (
+                      <div style={{ padding: "8px 12px", borderRadius: 6, background: "rgba(251,191,36,0.06)", border: "1px solid rgba(251,191,36,0.2)", display: "flex", alignItems: "flex-start", gap: 8 }}>
+                        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#fbbf24" strokeWidth="2" style={{ flexShrink: 0, marginTop: 1 }}>
+                          <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/>
+                          <line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/>
+                        </svg>
+                        <div>
+                          <span style={{ fontSize: 11, color: "#fbbf24", fontWeight: 600 }}>Possible duplicate</span>
+                          <span style={{ fontSize: 11, color: "#92400e" }}> — previously processed on {new Date(invoiceDuplicate.processedAt).toLocaleDateString()} ({invoiceDuplicate.filename})</span>
+                        </div>
+                      </div>
+                    )}
 
                     {/* Header fields — grouped sections */}
                     {HEADER_GROUPS.map(group => {
@@ -658,6 +1016,67 @@ export default function ExtractorApp() {
               </>
             )}
 
+            {/* ════ BATCH TAB ════ */}
+            {mode === "batch" && (
+              <>
+                {batchFiles.length === 0 ? (
+                  <div style={{ height: "100%", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 10 }}>
+                    <div style={{ width: 44, height: 44, borderRadius: 12, background: "#111", border: "1px solid #1e1e1e", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#2a2a2a" strokeWidth="1.5">
+                        <rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/>
+                        <rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/>
+                      </svg>
+                    </div>
+                    <p style={{ color: "#2a2a2a", fontSize: 12, textAlign: "center" }}>
+                      Add invoices in the queue →<br />then click Process All
+                    </p>
+                  </div>
+                ) : (
+                  <div style={{ padding: "12px 14px", display: "flex", flexDirection: "column", gap: 5 }}>
+                    <div style={{ display: "grid", gridTemplateColumns: "22px 1fr 70px 90px 90px 90px 70px", gap: "0 8px", padding: "0 8px", marginBottom: 2 }}>
+                      {["#", "File", "Code", "Vendor", "Inv No.", "Total", "Status"].map(h => (
+                        <span key={h} style={{ fontSize: 9, color: "#2a2a2a", fontWeight: 600, letterSpacing: "0.05em" }}>{h}</span>
+                      ))}
+                    </div>
+                    {batchFiles.map((bf, i) => {
+                      const statusColor = bf.status === "done" ? "#22c55e" : bf.status === "error" ? "#f87171" : bf.status === "processing" ? "#f97316" : "#333";
+                      const statusLabel = bf.status === "done"
+                        ? (bf.duplicate ? "⚠ Dup" : "Done")
+                        : bf.status === "error" ? "Error" : bf.status === "processing" ? "Processing…" : "Pending";
+                      const statusFinalColor = bf.status === "done" && bf.duplicate ? "#fbbf24" : statusColor;
+                      const total    = bf.result?.header.DocTotal;
+                      const currency = bf.result?.header.DocCurrency ?? "";
+                      const vendorMatch = matchVendor(bf.result?.header.CardName, vendors);
+                      return (
+                        <div key={bf.id} style={{ display: "grid", gridTemplateColumns: "22px 1fr 70px 90px 90px 90px 70px", gap: "0 8px", padding: "7px 8px", borderRadius: 6, background: "#0e0e0e", border: `1px solid ${bf.duplicate ? "rgba(251,191,36,0.15)" : bf.status === "error" ? "#2a1515" : "#161616"}`, alignItems: "center" }}>
+                          <span style={{ fontSize: 10, color: "#333" }}>{i + 1}</span>
+                          <span style={{ fontSize: 11, color: "#666", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={bf.file.name}>{bf.file.name}</span>
+                          <span style={{ fontSize: 11, color: vendorMatch ? "#f97316" : "#252525", fontFamily: "monospace", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={vendorMatch ? `${vendorMatch.vendor.CardCode} (${Math.round(vendorMatch.score * 100)}%)` : undefined}>
+                            {vendorMatch ? vendorMatch.vendor.CardCode : "—"}
+                          </span>
+                          <span style={{ fontSize: 11, color: bf.result?.header.CardName ? "#c8c8c8" : "#252525", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{bf.result?.header.CardName ?? "—"}</span>
+                          <span style={{ fontSize: 11, color: bf.result?.header.NumAtCard ? "#888" : "#252525", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{bf.result?.header.NumAtCard ?? "—"}</span>
+                          <span style={{ fontSize: 11, color: total != null ? "#f97316" : "#252525", fontFamily: "monospace", fontWeight: total != null ? 600 : 400 }}>
+                            {total != null ? `${currency} ${total.toLocaleString()}` : "—"}
+                          </span>
+                          <span style={{ fontSize: 10, color: statusFinalColor, fontWeight: 600 }}>{statusLabel}</span>
+                        </div>
+                      );
+                    })}
+                    {batchFiles.some(f => f.status === "error") && (
+                      <div style={{ marginTop: 4, padding: "6px 10px", borderRadius: 6, background: "rgba(248,113,113,0.04)", border: "1px solid rgba(248,113,113,0.1)" }}>
+                        {batchFiles.filter(f => f.status === "error").map(bf => (
+                          <div key={bf.id} style={{ fontSize: 10, color: "#666", marginBottom: 2 }}>
+                            <span style={{ color: "#888" }}>{bf.file.name}</span>: {bf.error}
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </>
+            )}
+
             {/* ════ RAW TEXT TAB ════ */}
             {mode === "text" && (
               <textarea
@@ -683,39 +1102,142 @@ export default function ExtractorApp() {
         {/* ── RIGHT: File Upload + Preview ── */}
         <div style={{ background: "#0c0c0c", borderRadius: 12, border: "1px solid #181818", display: "flex", flexDirection: "column", overflow: "hidden" }}>
           <div style={{ padding: "11px 14px", borderBottom: "1px solid #161616", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-            <div style={{ display: "flex", alignItems: "center", gap: 7 }}>
-              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#444" strokeWidth="2">
-                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
-                <polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/>
-              </svg>
-              <span style={{ fontSize: 11, color: "#444", fontWeight: 600, letterSpacing: "0.05em" }}>FILE</span>
-              {file && <span style={{ fontSize: 10, color: "#333" }}>{EXT_LABEL[ext] ?? ext.toUpperCase()} · {formatBytes(file.size)}</span>}
-            </div>
-            <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
-              {file && (
-                <button onClick={onClear} style={{ background: "#111", border: "1px solid #1e1e1e", borderRadius: 6, color: "#555", cursor: "pointer", fontSize: 11, padding: "4px 10px" }}>
-                  Remove
-                </button>
-              )}
-              <button
-                onClick={onExtract}
-                disabled={!file || activeStatus === "loading"}
-                style={{
-                  background: file && activeStatus !== "loading" ? "#fff" : "#161616",
-                  border: "1px solid transparent", borderRadius: 6,
-                  color: file && activeStatus !== "loading" ? "#000" : "#2a2a2a",
-                  cursor: file && activeStatus !== "loading" ? "pointer" : "not-allowed",
-                  fontSize: 11, fontWeight: 700, padding: "4px 16px",
-                  transition: "all 0.15s", letterSpacing: "0.02em",
-                }}
-              >
-                {activeStatus === "loading" ? "Extracting…" : "Extract"}
-              </button>
-            </div>
+            {mode === "batch" ? (
+              <>
+                <div style={{ display: "flex", alignItems: "center", gap: 7 }}>
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#444" strokeWidth="2">
+                    <rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/>
+                    <rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/>
+                  </svg>
+                  <span style={{ fontSize: 11, color: "#444", fontWeight: 600, letterSpacing: "0.05em" }}>QUEUE</span>
+                  {batchRunning && (
+                    <span style={{ fontSize: 10, color: "#f97316" }}>
+                      {batchFiles.filter(f => f.status === "done" || f.status === "error").length} / {batchFiles.length}
+                    </span>
+                  )}
+                </div>
+                <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                  <button
+                    onClick={() => batchInputRef.current?.click()}
+                    style={{ background: "#111", border: "1px solid #1e1e1e", borderRadius: 6, color: "#555", cursor: "pointer", fontSize: 11, padding: "4px 10px" }}
+                  >
+                    + Add Files
+                  </button>
+                  <input ref={batchInputRef} type="file" multiple accept={ACCEPTED.join(",")}
+                    onChange={e => { onAddBatchFiles(e.target.files); e.target.value = ""; }}
+                    style={{ display: "none" }} />
+                  <button
+                    onClick={onProcessBatch}
+                    disabled={batchRunning || !batchFiles.some(f => f.status === "pending")}
+                    style={{
+                      background: (!batchRunning && batchFiles.some(f => f.status === "pending")) ? "#fff" : "#161616",
+                      border: "1px solid transparent", borderRadius: 6,
+                      color: (!batchRunning && batchFiles.some(f => f.status === "pending")) ? "#000" : "#2a2a2a",
+                      cursor: (!batchRunning && batchFiles.some(f => f.status === "pending")) ? "pointer" : "not-allowed",
+                      fontSize: 11, fontWeight: 700, padding: "4px 16px", transition: "all 0.15s",
+                    }}
+                  >
+                    {batchRunning ? "Processing…" : "Process All"}
+                  </button>
+                </div>
+              </>
+            ) : (
+              <>
+                <div style={{ display: "flex", alignItems: "center", gap: 7 }}>
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#444" strokeWidth="2">
+                    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                    <polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/>
+                  </svg>
+                  <span style={{ fontSize: 11, color: "#444", fontWeight: 600, letterSpacing: "0.05em" }}>FILE</span>
+                  {file && <span style={{ fontSize: 10, color: "#333" }}>{EXT_LABEL[ext] ?? ext.toUpperCase()} · {formatBytes(file.size)}</span>}
+                </div>
+                <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                  {file && (
+                    <button onClick={onClear} style={{ background: "#111", border: "1px solid #1e1e1e", borderRadius: 6, color: "#555", cursor: "pointer", fontSize: 11, padding: "4px 10px" }}>
+                      Remove
+                    </button>
+                  )}
+                  <button
+                    onClick={onExtract}
+                    disabled={!file || activeStatus === "loading"}
+                    style={{
+                      background: file && activeStatus !== "loading" ? "#fff" : "#161616",
+                      border: "1px solid transparent", borderRadius: 6,
+                      color: file && activeStatus !== "loading" ? "#000" : "#2a2a2a",
+                      cursor: file && activeStatus !== "loading" ? "pointer" : "not-allowed",
+                      fontSize: 11, fontWeight: 700, padding: "4px 16px",
+                      transition: "all 0.15s", letterSpacing: "0.02em",
+                    }}
+                  >
+                    {activeStatus === "loading" ? "Extracting…" : "Extract"}
+                  </button>
+                </div>
+              </>
+            )}
           </div>
 
           <div style={{ flex: 1, position: "relative", overflow: "hidden" }}>
-            {!file ? (
+            {mode === "batch" ? (
+              <div
+                onDragOver={e => { e.preventDefault(); setDragging(true); }}
+                onDragLeave={() => setDragging(false)}
+                onDrop={e => { e.preventDefault(); setDragging(false); onAddBatchFiles(e.dataTransfer.files); }}
+                style={{ height: "100%", display: "flex", flexDirection: "column", overflow: "hidden" }}
+              >
+                {batchFiles.length === 0 ? (
+                  <div
+                    onClick={() => batchInputRef.current?.click()}
+                    style={{
+                      height: "100%", display: "flex", flexDirection: "column",
+                      alignItems: "center", justifyContent: "center", cursor: "pointer",
+                      border: `1.5px dashed ${dragging ? "#333" : "#191919"}`,
+                      borderRadius: 10, margin: 12, transition: "all 0.15s", gap: 14,
+                      background: dragging ? "rgba(255,255,255,0.01)" : "transparent",
+                    }}
+                  >
+                    <div style={{ width: 52, height: 52, borderRadius: 14, background: "#111", border: "1px solid #1e1e1e", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                      <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#333" strokeWidth="1.5">
+                        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                        <polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/>
+                      </svg>
+                    </div>
+                    <div style={{ textAlign: "center" }}>
+                      <p style={{ color: "#444", fontSize: 13, marginBottom: 5 }}>Drop multiple invoices or <span style={{ color: "#666", textDecoration: "underline", textUnderlineOffset: 3 }}>browse</span></p>
+                      <p style={{ color: "#2a2a2a", fontSize: 11 }}>PDF · PNG · JPG · TIFF · WEBP</p>
+                    </div>
+                  </div>
+                ) : (
+                  <div style={{ flex: 1, overflow: "auto", padding: "10px 12px", display: "flex", flexDirection: "column", gap: 4 }}>
+                    {batchFiles.map(bf => {
+                      const statusIcon = bf.status === "done"
+                        ? <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="#22c55e" strokeWidth="2.5"><polyline points="20 6 9 17 4 12"/></svg>
+                        : bf.status === "error"
+                        ? <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="#f87171" strokeWidth="2.5"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+                        : bf.status === "processing"
+                        ? <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="#f97316" strokeWidth="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+                        : <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="#333" strokeWidth="2"><circle cx="12" cy="12" r="10"/></svg>;
+                      return (
+                        <div key={bf.id} style={{ display: "flex", alignItems: "center", gap: 8, padding: "7px 10px", borderRadius: 6, background: "#0e0e0e", border: `1px solid ${bf.status === "error" ? "#2a1515" : "#161616"}` }}>
+                          {statusIcon}
+                          <span style={{ flex: 1, fontSize: 11, color: "#888", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={bf.file.name}>{bf.file.name}</span>
+                          <span style={{ fontSize: 10, color: "#333", flexShrink: 0 }}>{formatBytes(bf.file.size)}</span>
+                          {bf.status === "pending" && (
+                            <button onClick={() => onRemoveBatchFile(bf.id)} style={{ background: "none", border: "none", cursor: "pointer", color: "#2a2a2a", fontSize: 14, lineHeight: 1, padding: "0 2px" }}>×</button>
+                          )}
+                        </div>
+                      );
+                    })}
+                    {/* Drop more area */}
+                    <div
+                      onClick={() => batchInputRef.current?.click()}
+                      style={{ padding: "10px", borderRadius: 6, border: "1px dashed #1a1a1a", textAlign: "center", cursor: "pointer", color: "#2a2a2a", fontSize: 11, marginTop: 4 }}
+                    >
+                      + Add more files
+                    </div>
+                  </div>
+                )}
+              </div>
+            ) : !file ? (
               <div
                 onDragOver={(e) => { e.preventDefault(); setDragging(true); }}
                 onDragLeave={() => setDragging(false)}
@@ -768,6 +1290,7 @@ export default function ExtractorApp() {
           </div>
         </div>
       </div>
+
 
       {/* Loading bar */}
       {activeStatus === "loading" && (
