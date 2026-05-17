@@ -181,3 +181,35 @@ export function flattenText(result: ExtractionResult): string {
   if (result.pages) return result.pages.map((p) => p.text).join("\n\n");
   return "";
 }
+
+// ── SAP B1 push ───────────────────────────────────────────────────────────────
+
+export type SapCredentials = {
+  base_url: string;
+  company_db: string;
+  username: string;
+  password: string;
+  verify_ssl?: boolean;
+};
+
+export type SapPushResult = {
+  DocEntry: number;
+  DocNum: number;
+  message: string;
+};
+
+export async function pushToSap(
+  invoice: InvoiceExtractionResult,
+  creds: SapCredentials,
+): Promise<SapPushResult> {
+  const res = await fetch(`${BASE_URL}/api/v1/sap/push`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ invoice, ...creds }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(err.detail ?? "SAP push failed");
+  }
+  return res.json();
+}
